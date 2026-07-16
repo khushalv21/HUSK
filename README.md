@@ -1,5 +1,8 @@
 # Husk
 
+[![PyPI Version](https://img.shields.io/pypi/v/husk-local.svg)](https://pypi.org/project/husk-local/)
+[![PyPI Downloads](https://img.shields.io/pypi/dm/husk-local.svg)](https://pypi.org/project/husk-local/)
+
 *Your codebase's past, present, and architecture—laid bare.*
 
 Understand legacy codebases quickly and privately with offline static analysis and local LLMs, without uploading code or fighting heavy setups.
@@ -20,14 +23,21 @@ Understand legacy codebases quickly and privately with offline static analysis a
 
 ---
 
-## 📦 Quick Start
+## 💾 Installation
+
+You can install Husk directly from PyPI:
 
 ```bash
-# Set up environment
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt && pip install -e .
+pip install husk-local
+```
 
+---
+
+## 📦 Quick Start
+
+Once installed, you can start auditing any codebase immediately:
+
+```bash
 # Configure LLM credentials (or select Ollama for local model)
 husk init
 
