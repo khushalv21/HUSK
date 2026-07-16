@@ -1,8 +1,5 @@
 # Husk
 
-[![PyPI Version](https://img.shields.io/pypi/v/husk-local.svg)](https://pypi.org/project/husk-local/)
-[![PyPI Downloads](https://img.shields.io/pypi/dm/husk-local.svg)](https://pypi.org/project/husk-local/)
-
 *Your codebase's past, present, and architecture—laid bare.*
 
 Understand legacy codebases quickly and privately with offline static analysis and local LLMs, without uploading code or fighting heavy setups.
