@@ -67,6 +67,40 @@ module.exports = {
 };
 """)
 
+        # Create Java files
+        os.makedirs(os.path.join(self.test_dir, "com", "example", "util"), exist_ok=True)
+        self.java_app = os.path.join(self.test_dir, "Application.java")
+        with open(self.java_app, "w") as f:
+            f.write("""
+import com.example.util.Helper;
+import java.util.List;
+
+public class Application {
+    public Application() {
+    }
+
+    public void run() {
+        if (true && false) {
+            for (int i = 0; i < 10; i++) {
+                System.out.println(i);
+            }
+        }
+    }
+}
+""")
+
+        self.java_helper = os.path.join(self.test_dir, "com", "example", "util", "Helper.java")
+        with open(self.java_helper, "w") as f:
+            f.write("""
+package com.example.util;
+
+public class Helper {
+    public static int helperFunc() {
+        return 1;
+    }
+}
+""")
+
         # Create ignored directories and files
         self.ignored_dir = os.path.join(self.test_dir, "node_modules")
         os.makedirs(self.ignored_dir)
@@ -79,8 +113,8 @@ module.exports = {
     def test_crawler(self):
         crawler = RepoCrawler(self.test_dir)
         inventory = crawler.get_inventory()
-        
-        # Should find main.py, database.py, utils.py, index.js, api.js
+
+        # Should find main.py, database.py, utils.py, index.js, api.js, and the Java files,
         # and ignore node_modules/leftover.js
         files = {item["rel_path"] for item in inventory}
         self.assertIn("main.py", files)
@@ -88,8 +122,10 @@ module.exports = {
         self.assertIn("utils.py", files)
         self.assertIn("index.js", files)
         self.assertIn("api.js", files)
+        self.assertIn("Application.java", files)
+        self.assertIn(os.path.join("com", "example", "util", "Helper.java"), files)
         self.assertNotIn("node_modules/leftover.js", files)
-        self.assertEqual(len(files), 5)
+        self.assertEqual(len(files), 7)
 
     def test_python_parser(self):
         parser = CodeParser("python")
@@ -131,15 +167,15 @@ module.exports = {
     def test_dependency_graph(self):
         crawler = RepoCrawler(self.test_dir)
         inventory = crawler.get_inventory()
-        
+
         parsed_data = {}
         for item in inventory:
             parser = CodeParser(item["language"])
             parsed_data[item["rel_path"]] = parser.parse_file(os.path.join(self.test_dir, item["rel_path"]))
-            
+
         builder = DependencyGraphBuilder(inventory, parsed_data)
         graph = builder.build()
-        
+
         # Test edges exist
         # main.py -> database.py (via database import)
         self.assertTrue(graph.has_edge("main.py", "database.py"))
@@ -147,13 +183,38 @@ module.exports = {
         self.assertTrue(graph.has_edge("main.py", "utils.py"))
         # index.js -> api.js (via ./api import)
         self.assertTrue(graph.has_edge("index.js", "api.js"))
-        
+        # Application.java -> com/example/util/Helper.java (via com.example.util.Helper import)
+        helper_path = os.path.join("com", "example", "util", "Helper.java")
+        self.assertTrue(graph.has_edge("Application.java", helper_path))
+
         # Test mermaid output contains correct node names and mappings
         mermaid_str = builder.to_mermaid()
         self.assertIn("main.py", mermaid_str)
         self.assertIn("database.py", mermaid_str)
         self.assertIn("index.js", mermaid_str)
         self.assertIn("api.js", mermaid_str)
+        self.assertIn("Application.java", mermaid_str)
+
+    def test_java_parser(self):
+        parser = CodeParser("java")
+        result = parser.parse_file(self.java_app)
+
+        class_names = [c["name"] for c in result["classes"]]
+        self.assertIn("Application", class_names)
+
+        func_names = [f["name"] for f in result["functions"]]
+        self.assertIn("Application", func_names)  # constructor
+        self.assertIn("run", func_names)
+
+        imports = result["imports"]
+        self.assertIn("com.example.util.Helper", imports)
+        self.assertIn("java.util.List", imports)
+
+    def test_java_complexity(self):
+        parser = CodeParser("java")
+        # Application.run() has an if statement, a boolean && operator, and a for loop.
+        complexity = parser.calculate_complexity(self.java_app)
+        self.assertGreater(complexity, 1)
 
     def test_complexity(self):
         parser = CodeParser("python")
@@ -196,6 +257,42 @@ def check(x):
         self.assertEqual(metrics["churn"], 1)
         self.assertEqual(metrics["authors"], 1)
         self.assertNotEqual(metrics["last_modified"], "Unknown")
+
+    def test_bulk_file_metrics(self):
+        from git import Repo
+        repo = Repo.init(self.test_dir)
+
+        with repo.config_writer() as writer:
+            writer.set_value("user", "name", "Bulk Tester")
+            writer.set_value("user", "email", "bulk@example.com")
+
+        file_a = os.path.join(self.test_dir, "bulk_a.py")
+        file_b = os.path.join(self.test_dir, "bulk_b.py")
+        with open(file_a, "w") as f:
+            f.write("a = 1\n")
+        with open(file_b, "w") as f:
+            f.write("b = 1\n")
+        repo.index.add(["bulk_a.py", "bulk_b.py"])
+        repo.index.commit("Add a and b")
+
+        with open(file_a, "w") as f:
+            f.write("a = 2\n")
+        repo.index.add(["bulk_a.py"])
+        repo.index.commit("Update a")
+
+        from husk.history import GitAnalyzer
+        analyzer = GitAnalyzer(self.test_dir)
+        results = analyzer.get_bulk_file_metrics(["bulk_a.py", "bulk_b.py", "does_not_exist.py"])
+
+        self.assertEqual(results["bulk_a.py"]["churn"], 2)
+        self.assertEqual(results["bulk_b.py"]["churn"], 1)
+        self.assertEqual(results["does_not_exist.py"]["churn"], 0)
+        self.assertEqual(results["bulk_a.py"]["authors"], 1)
+        self.assertNotEqual(results["bulk_a.py"]["last_modified"], "Unknown")
+
+        # Should match the single-file method's result for the same repo state.
+        single = analyzer.get_file_metrics("bulk_a.py")
+        self.assertEqual(single["churn"], results["bulk_a.py"]["churn"])
 
     def test_file_cache(self):
         from husk.ai.cache import FileCache
@@ -426,6 +523,196 @@ def global_func():
         res4 = handle_ai_error(e4, "ollama", "llama3")
         self.assertIn("timed out", res4)
 
+    def test_vector_index_incremental_update(self):
+        from husk.ai.rag import VectorIndex
+
+        index_path = os.path.join(self.test_dir, ".husk", "rag_index.json")
+        index = VectorIndex(index_path)
+
+        # Index file "a.py" with one chunk
+        index.update_file("a.py", "sha_a_v1", [
+            {"text": "chunk a", "metadata": {"rel_path": "a.py", "type": "function", "name": "f"}, "embedding": [1.0, 0.0]}
+        ])
+        index.update_file("b.py", "sha_b_v1", [
+            {"text": "chunk b", "metadata": {"rel_path": "b.py", "type": "function", "name": "g"}, "embedding": [0.0, 1.0]}
+        ])
+        index.save()
+        self.assertEqual(len(index.chunks), 2)
+        self.assertEqual(index.get_file_hash("a.py"), "sha_a_v1")
+
+        # Reload from disk and confirm persistence round-trips file_hashes
+        reloaded = VectorIndex(index_path)
+        self.assertEqual(reloaded.get_file_hash("b.py"), "sha_b_v1")
+        self.assertEqual(len(reloaded.chunks), 2)
+
+        # Updating a.py with a new hash should replace only its chunks
+        reloaded.update_file("a.py", "sha_a_v2", [
+            {"text": "chunk a v2", "metadata": {"rel_path": "a.py", "type": "function", "name": "f"}, "embedding": [1.0, 1.0]}
+        ])
+        self.assertEqual(len(reloaded.chunks), 2)
+        a_chunks = [c for c in reloaded.chunks if c["metadata"]["rel_path"] == "a.py"]
+        self.assertEqual(len(a_chunks), 1)
+        self.assertEqual(a_chunks[0]["text"], "chunk a v2")
+
+        # Removing stale files (b.py no longer exists) drops its chunks and hash
+        removed = reloaded.remove_stale_files({"a.py"})
+        self.assertEqual(removed, ["b.py"])
+        self.assertEqual(len(reloaded.chunks), 1)
+        self.assertNotIn("b.py", reloaded.file_hashes)
+
+    def test_chunker_splits_oversized_chunks(self):
+        from husk.ai.rag import SyntaxAwareChunker, MAX_CHUNK_LINES
+
+        # A function far larger than MAX_CHUNK_LINES should be split into multiple parts.
+        body_lines = "\n".join([f"    x{i} = {i}" for i in range(MAX_CHUNK_LINES * 2)])
+        content = f"def big_func():\n{body_lines}\n"
+        parsed_data = {
+            "classes": [],
+            "functions": [{"name": "big_func", "start_line": 1, "end_line": MAX_CHUNK_LINES * 2 + 1}],
+        }
+
+        chunks = SyntaxAwareChunker.chunk_file("big.py", content, parsed_data)
+        func_chunks = [c for c in chunks if c["metadata"]["type"] == "function"]
+        self.assertGreater(len(func_chunks), 1)
+        for c in func_chunks:
+            self.assertLessEqual(c["metadata"]["end_line"] - c["metadata"]["start_line"] + 1, MAX_CHUNK_LINES)
+
+    def test_hybrid_search_keyword_boost(self):
+        from husk.ai.rag import VectorIndex
+
+        index = VectorIndex(os.path.join(self.test_dir, ".husk", "hybrid_index.json"))
+
+        # Two chunks with near-identical embeddings (so vector score alone can't
+        # distinguish them), but only one contains the exact identifier being searched for.
+        index.update_file("a.py", "sha_a", [
+            {
+                "text": "def parse_date(value):\n    return value",
+                "metadata": {"rel_path": "a.py", "type": "function", "name": "parse_date", "start_line": 1, "end_line": 2},
+                "embedding": [1.0, 0.0, 0.0],
+            }
+        ])
+        index.update_file("b.py", "sha_b", [
+            {
+                "text": "def unrelated_helper(value):\n    return value",
+                "metadata": {"rel_path": "b.py", "type": "function", "name": "unrelated_helper", "start_line": 1, "end_line": 2},
+                "embedding": [0.99, 0.01, 0.0],
+            }
+        ])
+
+        query_embedding = [0.98, 0.02, 0.0]  # close to both, doesn't clearly favor either
+        results = index.hybrid_search(query_embedding, "parse_date", top_k=2, vector_weight=0.5)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["chunk"]["metadata"]["rel_path"], "a.py")
+        self.assertGreater(results[0]["keyword_score"], results[1]["keyword_score"])
+        self.assertGreater(results[0]["score"], results[1]["score"])
+
+    def test_query_embedding_cache(self):
+        from husk.ai.rag import QueryEmbeddingCache
+
+        cache = QueryEmbeddingCache(self.test_dir)
+        self.assertIsNone(cache.get("nomic-embed-text", "how does auth work?"))
+
+        cache.set("nomic-embed-text", "how does auth work?", [0.1, 0.2, 0.3])
+        self.assertEqual(cache.get("nomic-embed-text", "how does auth work?"), [0.1, 0.2, 0.3])
+
+        # Different model -> different cache key, still a miss
+        self.assertIsNone(cache.get("text-embedding-3-small", "how does auth work?"))
+
+    def test_ollama_pull_model_throttles_progress_logs(self):
+        from husk.ai import ollama_setup
+        from unittest.mock import patch, MagicMock
+        import json as _json
+
+        # Simulate Ollama's real streaming behavior: many progress lines per layer
+        # (one per network chunk), almost all with the same status text but climbing
+        # completed/total counts, followed by a couple of one-off status lines.
+        lines = []
+        total = 1_000_000
+        for completed in range(0, total + 1, total // 200):  # 201 progress updates
+            lines.append(_json.dumps({
+                "status": "pulling abc123", "digest": "abc123", "total": total, "completed": completed
+            }).encode("utf-8"))
+        lines.append(_json.dumps({"status": "verifying sha256 digest"}).encode("utf-8"))
+        lines.append(_json.dumps({"status": "success"}).encode("utf-8"))
+
+        mock_resp = MagicMock()
+        mock_resp.__enter__.return_value = iter(lines)
+        mock_resp.__exit__.return_value = False
+
+        logs = []
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            ok = ollama_setup.pull_model("http://localhost:11434", "qwen2.5-coder:1.5b", log_fn=logs.append)
+
+        self.assertTrue(ok)
+        # 201 raw progress lines should collapse to at most ~11 (0%,10%,...,100%) plus the
+        # two one-off status lines, instead of flooding the log with near-duplicates.
+        self.assertLess(len(logs), 20)
+        self.assertTrue(any("100%" in l for l in logs))
+        self.assertTrue(any("verifying sha256 digest" in l for l in logs))
+        self.assertTrue(any("success" in l for l in logs))
+
+    def test_ollama_setup_ensure_models(self):
+        from husk.ai import ollama_setup
+        from unittest.mock import patch
+
+        logs = []
+
+        # Ollama unreachable -> ensure_models fails cleanly with a helpful message.
+        with patch.object(ollama_setup, "is_ollama_running", return_value=False):
+            ok = ollama_setup.ensure_models("http://localhost:11434", ["qwen2.5-coder:1.5b"], log_fn=logs.append)
+        self.assertFalse(ok)
+        self.assertTrue(any("Could not reach Ollama" in l for l in logs))
+
+        # Ollama reachable, model already installed -> no pull attempted.
+        logs.clear()
+        with patch.object(ollama_setup, "is_ollama_running", return_value=True), \
+             patch.object(ollama_setup, "list_installed_models", return_value=["qwen2.5-coder:1.5b"]), \
+             patch.object(ollama_setup, "pull_model") as mock_pull:
+            ok = ollama_setup.ensure_models("http://localhost:11434", ["qwen2.5-coder:1.5b"], log_fn=logs.append)
+        self.assertTrue(ok)
+        mock_pull.assert_not_called()
+
+        # Ollama reachable, model missing -> pull_model is invoked.
+        logs.clear()
+        with patch.object(ollama_setup, "is_ollama_running", return_value=True), \
+             patch.object(ollama_setup, "list_installed_models", return_value=[]), \
+             patch.object(ollama_setup, "pull_model", return_value=True) as mock_pull:
+            ok = ollama_setup.ensure_models("http://localhost:11434", ["nomic-embed-text"], log_fn=logs.append)
+        self.assertTrue(ok)
+        mock_pull.assert_called_once()
+
+    def test_resolve_embedding_backend(self):
+        from husk.cli import resolve_embedding_backend
+        from husk.config import ConfigManager
+        from unittest.mock import MagicMock
+
+        config_mgr = MagicMock(spec=ConfigManager)
+        config_mgr.get.return_value = "http://localhost:11434"
+
+        # Anthropic has no embeddings API -> should route to local Ollama, not crash.
+        emb_provider, emb_api_key, emb_model, note = resolve_embedding_backend(
+            "anthropic", config_mgr, "sk-ant-fake-key"
+        )
+        self.assertEqual(emb_provider, "ollama")
+        self.assertEqual(emb_api_key, "http://localhost:11434")
+        self.assertEqual(emb_model, "nomic-embed-text")
+        self.assertIn("Anthropic has no embeddings API", note)
+
+        # OpenAI and Ollama pass through with their own embedding models.
+        emb_provider, emb_api_key, emb_model, note = resolve_embedding_backend(
+            "openai", config_mgr, "sk-fake-key"
+        )
+        self.assertEqual(emb_provider, "openai")
+        self.assertEqual(emb_model, "text-embedding-3-small")
+        self.assertIsNone(note)
+
+        emb_provider, emb_api_key, emb_model, note = resolve_embedding_backend(
+            "ollama", config_mgr, "http://localhost:11434"
+        )
+        self.assertEqual(emb_provider, "ollama")
+        self.assertEqual(emb_model, "nomic-embed-text")
+
     def test_help_command(self):
         from click.testing import CliRunner
         from husk.cli import help
@@ -433,7 +720,8 @@ def global_func():
         runner = CliRunner()
         result = runner.invoke(help)
         self.assertEqual(result.exit_code, 0)
-        self.assertIn("HUSK CLI MENU", result.output)
+        self.assertIn("HUSK", result.output)
+        self.assertIn("Your codebase's past, present, and architecture", result.output)
         self.assertIn("COMMANDS:", result.output)
         self.assertIn("EXAMPLES:", result.output)
 

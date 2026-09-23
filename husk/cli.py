@@ -2,6 +2,7 @@ import os
 import tempfile
 import git
 from contextlib import contextmanager
+from typing import Optional
 import click
 from husk.crawler import RepoCrawler
 from husk.parser import CodeParser
@@ -12,7 +13,8 @@ from husk.ai.cache import FileCache
 from husk.ai.adapters import get_adapter
 from husk.ai.estimator import TokenEstimator
 from husk.ai.summarizer import CodeSummarizer
-from husk.ai.rag import SyntaxAwareChunker, EmbeddingClient, VectorIndex
+from husk.ai.rag import SyntaxAwareChunker, EmbeddingClient, VectorIndex, QueryEmbeddingCache
+from husk.ai.ollama_setup import ensure_models, DEFAULT_CHAT_MODEL, DEFAULT_EMBED_MODEL
 
 def resolve_repo_path(path_or_url: str):
     """
@@ -40,6 +42,26 @@ def resolve_repo_path(path_or_url: str):
         if not os.path.isdir(abs_path):
             raise click.BadParameter(f"Path '{path_or_url}' is not a directory.")
         return abs_path, None
+
+def resolve_embedding_backend(provider: str, config_mgr: "ConfigManager", api_key: Optional[str]):
+    """
+    Determines which provider/key/model to use for embeddings.
+
+    Anthropic has no embeddings API, so RAG indexing/search for anthropic users
+    is routed to a local Ollama instance instead of crashing on an unsupported
+    provider.
+    """
+    if provider == "anthropic":
+        ollama_url = config_mgr.get("api_url") or "http://localhost:11434"
+        return "ollama", ollama_url, "nomic-embed-text", (
+            "Anthropic has no embeddings API — using local Ollama "
+            f"('{ollama_url}', model 'nomic-embed-text') for search indexing instead."
+        )
+    if provider == "openai":
+        return "openai", api_key, "text-embedding-3-small", None
+    if provider in ("ollama", "local"):
+        return provider, api_key, "nomic-embed-text", None
+    return provider, api_key, None, None
 
 def handle_ai_error(e: Exception, provider: str, model: str) -> str:
     """
@@ -86,11 +108,48 @@ def handle_ai_error(e: Exception, provider: str, model: str) -> str:
     # Default fallback
     return f"Failed to communicate with {provider.upper()}: {e}"
 
-@click.group()
-@click.version_option("0.1.0", message="Husk v%(version)s")
-def main():
+MENU_COMMANDS = [
+    ("scan [path_or_url] [--detailed] [--with-ai]", "Crawl the repo and inventory files, classes, functions, and imports."),
+    ("graph [path_or_url] [--output path]", "Generate and visualize a Mermaid module dependency graph."),
+    ("hotspots [path_or_url]", "Rank source files by maintenance risk (Complexity × Git Churn)."),
+    ("deadcode [path_or_url]", "Scan for unreferenced files in the module import graph."),
+    ("init", "Configure an AI provider — OpenAI, Anthropic, Ollama, or zero-key local."),
+    ("doc [path_or_url] [--with-ai]", "Generate structured documentation reports under /docs."),
+    ("ask \"query\" [path_or_url] [--rebuild]", "Ask questions about the codebase in plain English via RAG."),
+]
+
+def render_menu():
+    """
+    Renders the colored command menu shared by the bare `husk` invocation and `husk help`.
+    """
+    click.secho("HUSK", fg="cyan", bold=True)
+    click.echo("Your codebase's past, present, and architecture — laid bare.\n")
+
+    click.secho("COMMANDS:", fg="yellow", bold=True)
+    for usage, desc in MENU_COMMANDS:
+        click.secho(f"  husk {usage}", fg="green", bold=True)
+        click.echo(f"    {desc}")
+    click.echo("")
+
+    click.secho("EXAMPLES:", fg="yellow", bold=True)
+    click.echo("  * Local analysis (no key needed):")
+    click.echo("      husk scan . --detailed")
+    click.echo("      husk hotspots .")
+    click.echo("  * Remote Git scanning:")
+    click.echo("      husk scan https://github.com/example/project.git")
+    click.echo("  * Zero-API-key AI mode:")
+    click.echo("      husk init                 # choose \"local\" — no API key required")
+    click.echo("      husk ask \"how does authentication work?\"")
+    click.echo("")
+    click.echo("Run 'husk COMMAND --help' for full options on any command.")
+
+@click.group(invoke_without_command=True)
+@click.version_option("0.2.0", message="Husk v%(version)s")
+@click.pass_context
+def main(ctx):
     """Husk: A local-first CLI engine for legacy codebases."""
-    pass
+    if ctx.invoked_subcommand is None:
+        render_menu()
 
 @main.command()
 @click.argument("repo_path", default=".")
@@ -160,7 +219,7 @@ def scan(repo_path, detailed, with_ai, ai_budget, dry_run_ai):
                     click.echo(f"  Imports: {', '.join(result['imports'])}")
                 click.echo("")
             except Exception as e:
-                click.echo(f"  [ERROR] Parsing failed: {e}")
+                click.secho(f"  [ERROR] Parsing failed: {e}", fg="red")
                 
     click.echo("-" * 60)
     click.echo("Summary Stats:")
@@ -215,7 +274,7 @@ def scan(repo_path, detailed, with_ai, ai_budget, dry_run_ai):
             return
             
         if not api_key and provider != "ollama":
-            click.echo(f"\n[ERROR] API key for {provider} not found. Please set the env var or run 'husk init'.")
+            click.secho(f"\n[ERROR] API key for {provider} not found. Please set the env var or run 'husk init'.", fg="red")
             return
             
         # Check budget limit (budget is in cents, cost is in dollars)
@@ -223,14 +282,16 @@ def scan(repo_path, detailed, with_ai, ai_budget, dry_run_ai):
             budget_usd = ai_budget / 100.0
             click.echo(f"  * Budget Limit: {estimator.format_cost(budget_usd)}")
             if est_cost > budget_usd:
-                click.echo(f"\n[ABORTED] Estimated cost {estimator.format_cost(est_cost)} exceeds the budget of {estimator.format_cost(budget_usd)}.")
+                click.secho(f"\n[ABORTED] Estimated cost {estimator.format_cost(est_cost)} exceeds the budget of {estimator.format_cost(budget_usd)}.", fg="red")
                 return
                 
         if uncached_files:
             click.confirm("\nDo you want to proceed with LLM processing?", abort=True)
-            
+
+            if provider in ("ollama", "local"):
+                ensure_models(api_key, [model], log_fn=click.echo, announce_present=False)
             adapter = get_adapter(provider, api_key, model)
-            
+
             click.echo("\nRunning AI summarization...")
             for rel_path in inventory:
                 path = rel_path["rel_path"]
@@ -254,7 +315,7 @@ def scan(repo_path, detailed, with_ai, ai_budget, dry_run_ai):
                         cache.set_summary(path, full_path, summary.strip())
                         click.echo(f"  {summary.strip()}")
                     except Exception as e:
-                        click.echo(f"  [ERROR] Summarization failed: {e}")
+                        click.secho(f"  [ERROR] Summarization failed: {e}", fg="red")
         else:
             click.echo("\nAll files are cached. Summary output:")
             for rel_path in inventory:
@@ -306,7 +367,7 @@ def graph(repo_path, output):
             f.write("# Module Dependency Graph\n\n```mermaid\n")
             f.write(mermaid_str)
             f.write("\n```\n")
-        click.echo(f"Wrote dependency graph to {output}")
+        click.secho(f"Wrote dependency graph to {output}", fg="green")
 
 @main.command()
 @click.argument("repo_path", default=".")
@@ -322,24 +383,26 @@ def hotspots(repo_path):
     
     if not git_analyzer.is_git_repo():
         click.echo("Warning: Not a git repository. Git churn statistics will not be available.", err=True)
-        
+
     hotspots_list = []
-    
+    all_rel_paths = [item["rel_path"] for item in inventory]
+    bulk_metrics = git_analyzer.get_bulk_file_metrics(all_rel_paths)
+
     for item in inventory:
         rel_path = item["rel_path"]
         lang = item["language"]
-        
+
         # Calculate complexity
         try:
             parser = CodeParser(lang)
             complexity = parser.calculate_complexity(os.path.join(repo_path, rel_path))
         except Exception:
             complexity = 1
-            
+
         # Get churn
-        git_metrics = git_analyzer.get_file_metrics(rel_path)
+        git_metrics = bulk_metrics[rel_path]
         churn = git_metrics["churn"]
-        
+
         score = complexity * churn
         hotspots_list.append({
             "rel_path": rel_path,
@@ -414,30 +477,39 @@ def init():
     Initialize and configure the Husk settings file (~/.husk/config.yaml).
     """
     config_mgr = ConfigManager()
-    
+
     click.echo("--- Husk Config Wizard ---")
-    
+    click.echo("Providers: openai, anthropic, ollama (bring your own local model), "
+                "or local (no key needed — auto-installs a small default model via Ollama).\n")
+
     provider = click.prompt(
         "Choose an AI provider",
-        type=click.Choice(["openai", "anthropic", "ollama"], case_sensitive=False),
+        type=click.Choice(["openai", "anthropic", "ollama", "local"], case_sensitive=False),
         default=config_mgr.get("provider")
     ).lower()
-    
+
     default_model = "gpt-4o-mini"
     if provider == "anthropic":
         default_model = "claude-3-5-sonnet-20241022"
     elif provider == "ollama":
         default_model = "llama3"
-        
-    model = click.prompt(
-        f"Enter the model name to use",
-        type=str,
-        default=config_mgr.get("model") if config_mgr.get("provider") == provider else default_model
-    )
-    
+    elif provider == "local":
+        default_model = DEFAULT_CHAT_MODEL
+
+    if provider == "local":
+        # Zero-key path: skip the model prompt entirely and use the curated small default.
+        model = default_model
+        click.echo(f"Using default local model: {model} (no API key required).")
+    else:
+        model = click.prompt(
+            f"Enter the model name to use",
+            type=str,
+            default=config_mgr.get("model") if config_mgr.get("provider") == provider else default_model
+        )
+
     api_key = ""
     api_url = "http://localhost:11434"
-    
+
     if provider in ("openai", "anthropic"):
         api_key = click.prompt(
             "Enter your API key (leave empty to use env variables)",
@@ -445,20 +517,32 @@ def init():
             show_default=False,
             hide_input=True
         )
-    elif provider == "ollama":
+    elif provider in ("ollama", "local"):
         api_url = click.prompt(
             "Enter Ollama server Host URL",
             default=config_mgr.get("api_url") or "http://localhost:11434"
         )
-        
+
     config_mgr.set("provider", provider)
     config_mgr.set("model", model)
     if api_key:
         config_mgr.set("api_key", api_key)
-    if provider == "ollama":
+    if provider in ("ollama", "local"):
         config_mgr.set("api_url", api_url)
-        
-    click.echo(f"\nConfiguration saved to {config_mgr.config_path}")
+
+    click.secho(f"\nConfiguration saved to {config_mgr.config_path}", fg="green")
+
+    if provider == "local":
+        click.echo("\nProvisioning local models via Ollama (no key needed)...")
+        ok = ensure_models(api_url, [model, DEFAULT_EMBED_MODEL], log_fn=click.echo)
+        if ok:
+            click.echo("\nHusk is ready to use with no API key — try 'husk ask \"...\"' or 'husk doc --with-ai'.")
+        else:
+            click.echo(
+                "\n[WARNING] Could not finish provisioning automatically. "
+                "Make sure Ollama is installed and running, then re-run 'husk init' "
+                "or manually run: ollama pull " + model
+            )
 
 @main.command()
 @click.argument("repo_path", default=".")
@@ -570,7 +654,7 @@ def doc(repo_path, with_ai, ai_budget, dry_run_ai):
         click.echo("AI generation not requested. Running static documentation suite...")
     else:
         if not api_key and provider != "ollama":
-            click.echo(f"\n[ERROR] API key for {provider} not found. Please set the env var or run 'husk init'.")
+            click.secho(f"\n[ERROR] API key for {provider} not found. Please set the env var or run 'husk init'.", fg="red")
             return
             
         # Check budget
@@ -578,13 +662,15 @@ def doc(repo_path, with_ai, ai_budget, dry_run_ai):
             budget_usd = ai_budget / 100.0
             click.echo(f"  * Budget Limit: {estimator.format_cost(budget_usd)}")
             if est_cost > budget_usd:
-                click.echo(f"\n[ABORTED] Estimated cost {estimator.format_cost(est_cost)} exceeds the budget of {estimator.format_cost(budget_usd)}.")
+                click.secho(f"\n[ABORTED] Estimated cost {estimator.format_cost(est_cost)} exceeds the budget of {estimator.format_cost(budget_usd)}.", fg="red")
                 return
                 
         # Confirm
         click.confirm("\nProceed with Map-Reduce AI documentation generation?", abort=True)
         
         try:
+            if provider in ("ollama", "local"):
+                ensure_models(api_key, [model], log_fn=click.echo, announce_present=False)
             # Initialize real adapter
             real_adapter = get_adapter(provider, api_key, model)
             summarizer.adapter = real_adapter
@@ -617,7 +703,7 @@ def doc(repo_path, with_ai, ai_budget, dry_run_ai):
             os.makedirs(docs_dir, exist_ok=True)
             with open(arch_file, "w") as f:
                 f.write(arch_markdown)
-            click.echo(f"Wrote system architecture document to {arch_file}")
+            click.secho(f"Wrote system architecture document to {arch_file}", fg="green")
         except Exception as e:
             raise click.ClickException(handle_ai_error(e, provider, model))
 
@@ -646,15 +732,16 @@ def doc(repo_path, with_ai, ai_budget, dry_run_ai):
         mermaid_str = graph_builder.to_mermaid()
         with open(graph_file, "w") as f:
             f.write(f"# Dependency Graph\n\n```mermaid\n{mermaid_str}\n```\n")
-        click.echo(f"  * Wrote {graph_file}")
+        click.secho(f"  * Wrote {graph_file}", fg="green")
     except Exception as e:
-        click.echo(f"  [Warning] Failed to generate dependency graph: {e}")
+        click.secho(f"  [Warning] Failed to generate dependency graph: {e}", fg="yellow")
         
     # 2. hotspots.md
     hotspots_file = os.path.join(docs_dir, "hotspots.md")
     try:
         git_analyzer = GitAnalyzer(repo_path)
         hotspots_list = []
+        bulk_metrics = git_analyzer.get_bulk_file_metrics([item["rel_path"] for item in inventory])
         for item in inventory:
             path = item["rel_path"]
             lang = item["language"]
@@ -663,7 +750,7 @@ def doc(repo_path, with_ai, ai_budget, dry_run_ai):
                 complexity = parser.calculate_complexity(os.path.join(repo_path, path))
             except Exception:
                 complexity = 1
-            metrics = git_analyzer.get_file_metrics(path)
+            metrics = bulk_metrics[path]
             score = complexity * metrics["churn"]
             hotspots_list.append({
                 "path": path,
@@ -680,9 +767,9 @@ def doc(repo_path, with_ai, ai_budget, dry_run_ai):
             f.write("| --- | --- | --- | --- | --- | --- |\n")
             for h in hotspots_list:
                 f.write(f"| {h['path']} | {h['complexity']} | {h['churn']} | {h['score']} | {h['authors']} | {h['last_modified']} |\n")
-        click.echo(f"  * Wrote {hotspots_file}")
+        click.secho(f"  * Wrote {hotspots_file}", fg="green")
     except Exception as e:
-        click.echo(f"  [Warning] Failed to generate hotspots report: {e}")
+        click.secho(f"  [Warning] Failed to generate hotspots report: {e}", fg="yellow")
         
     # 3. deadcode.md
     deadcode_file = os.path.join(docs_dir, "deadcode.md")
@@ -699,11 +786,11 @@ def doc(repo_path, with_ai, ai_budget, dry_run_ai):
                         f.write(f"- `{c}`\n")
                 else:
                     f.write("No dead code candidates detected.\n")
-            click.echo(f"  * Wrote {deadcode_file}")
+            click.secho(f"  * Wrote {deadcode_file}", fg="green")
         else:
-            click.echo("  [Warning] Skipping dead code report: dependency graph was not built.")
+            click.secho("  [Warning] Skipping dead code report: dependency graph was not built.", fg="yellow")
     except Exception as e:
-        click.echo(f"  [Warning] Failed to generate dead code report: {e}")
+        click.secho(f"  [Warning] Failed to generate dead code report: {e}", fg="yellow")
         
     # 4. index.md
     index_file = os.path.join(docs_dir, "index.md")
@@ -730,20 +817,74 @@ def doc(repo_path, with_ai, ai_budget, dry_run_ai):
             f.write("| File | Summary |\n")
             f.write("| --- | --- |\n")
             f.write(summaries_table + "\n")
-        click.echo(f"  * Wrote {index_file}")
+        click.secho(f"  * Wrote {index_file}", fg="green")
     except Exception as e:
-        click.echo(f"  [Warning] Failed to generate index.md: {e}")
+        click.secho(f"  [Warning] Failed to generate index.md: {e}", fg="yellow")
         
-    click.echo("\nDocumentation suite successfully updated!")
+    click.secho("\nDocumentation suite successfully updated!", fg="green")
+
+def _print_ask_results(query, search_results, adapter, provider, model):
+    """
+    Runs one query against an already-searched result set: prints scored citations
+    with snippets, then synthesizes and prints the LLM answer. Shared by single-shot
+    and interactive `husk ask` so the two modes render identically.
+    """
+    if not search_results:
+        click.echo("No relevant code chunks found.")
+        return
+
+    context_blocks = []
+    citations = []
+    for result in search_results:
+        chunk = result["chunk"]
+        meta = chunk["metadata"]
+        pct = round(result["score"] * 100)
+        cite = f"{meta['rel_path']} (Lines {meta['start_line']}-{meta['end_line']}, Type: {meta['type']})"
+        citations.append((cite, pct, result["vector_score"], result["keyword_score"], chunk["text"]))
+
+        block = f"--- Citation: {cite} (Relevance: {pct}%) ---\n"
+        if "why" in meta:
+            block += f"// Why annotation: {meta['why']}\n"
+        block += chunk["text"] + "\n"
+        context_blocks.append(block)
+
+    context_text = "\n".join(context_blocks)
+
+    click.echo("Synthesizing answer...")
+    system_prompt = (
+        "You are an expert software archaeologist. Answer the user's question about the codebase "
+        "using the provided relevant code chunks and documentation snippets. Provide structured, "
+        "accurate explanations. Cite file paths and lines wherever appropriate."
+    )
+    user_prompt = f"Relevant Codebase Context:\n\n{context_text}\n\nQuestion: {query}"
+
+    try:
+        answer = adapter.generate(user_prompt, system_prompt)
+    except Exception as e:
+        raise click.ClickException(handle_ai_error(e, provider, model))
+
+    click.secho("\n--- Answer ---", fg="cyan", bold=True)
+    click.echo(answer)
+    click.secho("\n--- Sources & Citations ---", fg="cyan", bold=True)
+    for cite, pct, vector_score, keyword_score, text in citations:
+        click.secho(f"- {cite}  [{pct}% match — vector {vector_score:.2f}, keyword {keyword_score:.2f}]", fg="green")
+        snippet_lines = text.splitlines()[:4]
+        for line in snippet_lines:
+            click.secho(f"    {line}", fg="bright_black")
+        if len(text.splitlines()) > 4:
+            click.secho("    ...", fg="bright_black")
 
 @main.command()
-@click.argument("query")
+@click.argument("query", required=False, default=None)
 @click.argument("repo_path", default=".")
 @click.option("--rebuild", is_flag=True, help="Force rebuild the RAG search index.")
-def ask(query, repo_path, rebuild):
+@click.option("--interactive", "-i", is_flag=True, help="Start an interactive Q&A session instead of a single query.")
+def ask(query, repo_path, rebuild, interactive):
     """
     Query the codebase in plain English using RAG search.
     """
+    if not interactive and not query:
+        raise click.UsageError("QUERY is required unless --interactive/-i is set.")
     repo_path, _temp_dir = resolve_repo_path(repo_path)
     config_mgr = ConfigManager()
     provider = config_mgr.get("provider")
@@ -759,167 +900,149 @@ def ask(query, repo_path, rebuild):
         api_key = None
         
     if not api_key and provider != "ollama":
-        click.echo(f"[ERROR] API key for {provider} not found. Please set the env var or run 'husk init'.")
+        click.secho(f"[ERROR] API key for {provider} not found. Please set the env var or run 'husk init'.", fg="red")
         return
-        
+
     index_file = os.path.join(repo_path, ".husk", "rag_index.json")
     index = VectorIndex(index_file)
-    
-    emb_model = None
-    if provider == "openai":
-        emb_model = "text-embedding-3-small"
-    elif provider in ("ollama", "local"):
-        emb_model = "nomic-embed-text"
-        
-    emb_client = EmbeddingClient(provider, api_key, emb_model)
-    
-    if not index.chunks or rebuild:
-        click.echo("Building search index... (This may take a moment to embed chunks)")
+
+    emb_provider, emb_api_key, emb_model, emb_note = resolve_embedding_backend(provider, config_mgr, api_key)
+    if emb_note:
+        click.echo(emb_note)
+    if emb_model is None:
+        raise click.ClickException(
+            f"No embedding backend available for provider '{provider}'. "
+            "Configure 'openai' or 'ollama' (or run 'husk init') to use 'husk ask'."
+        )
+
+    # Pre-flight: if we're using Ollama for embeddings (directly, or as the
+    # Anthropic-has-no-embeddings fallback), make sure the model is actually pulled
+    # instead of failing deep inside the indexing loop.
+    if emb_provider in ("ollama", "local"):
+        ensure_models(emb_api_key, [emb_model], log_fn=click.echo, announce_present=False)
+
+    emb_client = EmbeddingClient(emb_provider, emb_api_key, emb_model)
+
+    if rebuild:
+        click.echo("--rebuild passed: wiping search index for a full re-index.")
         index.clear()
-        
-        crawler = RepoCrawler(repo_path)
-        inventory = crawler.get_inventory()
-        cache = FileCache(repo_path)
-        git_analyzer = GitAnalyzer(repo_path)
-        
-        # 1. Add Code Chunks
-        for item in inventory:
+
+    crawler = RepoCrawler(repo_path)
+    inventory = crawler.get_inventory()
+    cache = FileCache(repo_path)
+    git_analyzer = GitAnalyzer(repo_path)
+
+    known_paths = {item["rel_path"] for item in inventory}
+    removed = index.remove_stale_files(known_paths)
+    if removed:
+        click.echo(f"Removed {len(removed)} deleted file(s) from index.")
+
+    # Only files that are new or whose content hash changed since the last index need
+    # re-chunking/re-embedding — unchanged files are skipped entirely.
+    changed_items = []
+    for item in inventory:
+        path = item["rel_path"]
+        full_path = os.path.join(repo_path, path)
+        sha = FileCache.compute_sha256(full_path)
+        if sha and index.get_file_hash(path) != sha:
+            changed_items.append((item, sha))
+
+    if changed_items:
+        click.echo(f"Indexing {len(changed_items)} new/changed file(s)... (this may take a moment)")
+        for item, sha in changed_items:
             path = item["rel_path"]
             lang = item["language"]
-            
+            full_path = os.path.join(repo_path, path)
+
             try:
-                with open(os.path.join(repo_path, path), "r", errors="ignore") as f:
+                with open(full_path, "r", errors="ignore") as f:
                     content = f.read()
-                    
+
                 parser = CodeParser(lang)
-                parsed_data = parser.parse_file(os.path.join(repo_path, path))
-                
-                # Split using Chunker
-                chunks = SyntaxAwareChunker.chunk_file(path, content, parsed_data)
-                
-                for chunk in chunks:
+                parsed_data = parser.parse_file(full_path)
+                file_chunks = SyntaxAwareChunker.chunk_file(path, content, parsed_data)
+
+                new_chunk_objs = []
+                for chunk in file_chunks:
                     meta = chunk["metadata"]
                     # Add git blame why annotation
                     blame = git_analyzer.get_line_range_blame(path, meta["start_line"], meta["end_line"])
                     if blame["sha"] != "Unknown":
                         meta["why"] = f"Last changed in commit {blame['sha']} by {blame['author']}: '{blame['message']}'"
-                        
+
                     emb = emb_client.get_embedding(chunk["text"])
-                    index.add_chunk(chunk["text"], meta, emb)
+                    new_chunk_objs.append({"text": chunk["text"], "metadata": meta, "embedding": emb})
+
+                # Include the file's AI summary (if any) as an extra searchable chunk
+                summary = cache.get_summary(path, full_path)
+                if summary:
+                    meta = {
+                        "rel_path": path,
+                        "type": "file_summary",
+                        "name": "summary",
+                        "start_line": 1,
+                        "end_line": 1
+                    }
+                    text = f"// File summary for {path}\n{summary}"
+                    emb = emb_client.get_embedding(text)
+                    new_chunk_objs.append({"text": text, "metadata": meta, "embedding": emb})
+
+                index.update_file(path, sha, new_chunk_objs)
             except Exception as e:
                 click.echo(f"Warning: Failed to index file {path}: {e}")
-                
-        # 2. Add Doc Summaries
-        for item in inventory:
-            path = item["rel_path"]
-            full_path = os.path.join(repo_path, path)
-            summary = cache.get_summary(path, full_path)
-            if summary:
-                meta = {
-                    "rel_path": path,
-                    "type": "file_summary",
-                    "name": "summary",
-                    "start_line": 1,
-                    "end_line": 1
-                }
-                text = f"// File summary for {path}\n{summary}"
-                emb = emb_client.get_embedding(text)
-                index.add_chunk(text, meta, emb)
-                
+
         index.save()
-        click.echo(f"Successfully indexed {len(index.chunks)} chunks.")
-        
-    # Search
-    click.echo(f"Searching index for: '{query}'...")
-    try:
-        query_emb = emb_client.get_embedding(query)
-        search_results = index.search(query_emb, top_k=5)
-    except Exception as e:
-        raise click.ClickException(handle_ai_error(e, provider, model))
-        
-    if not search_results:
-        click.echo("No relevant code chunks found.")
-        return
-        
-    # Collate Context
-    context_blocks = []
-    citations = []
-    for chunk, similarity in search_results:
-        meta = chunk["metadata"]
-        cite = f"{meta['rel_path']} (Lines {meta['start_line']}-{meta['end_line']}, Type: {meta['type']})"
-        citations.append(cite)
-        
-        block = f"--- Citation: {cite} (Similarity: {similarity:.4f}) ---\n"
-        if "why" in meta:
-            block += f"// Why annotation: {meta['why']}\n"
-        block += chunk["text"] + "\n"
-        context_blocks.append(block)
-        
-    context_text = "\n".join(context_blocks)
-    
-    # Query LLM
-    click.echo("Synthesizing answer...")
+        click.echo(f"Index now has {len(index.chunks)} chunks across {len(index.file_hashes)} file(s).")
+    else:
+        click.echo("Index is up to date. No files changed since the last index.")
+
+    # Chat model pre-flight + adapter, built once and reused across queries (important for
+    # --interactive, where re-pulling/reconnecting per question would be wasteful).
+    if provider in ("ollama", "local"):
+        ensure_models(api_key, [model], log_fn=click.echo, announce_present=False)
     adapter = get_adapter(provider, api_key, model)
-    system_prompt = (
-        "You are an expert software archaeologist. Answer the user's question about the codebase "
-        "using the provided relevant code chunks and documentation snippets. Provide structured, "
-        "accurate explanations. Cite file paths and lines wherever appropriate."
-    )
-    user_prompt = f"Relevant Codebase Context:\n\n{context_text}\n\nQuestion: {query}"
-    
-    try:
-        answer = adapter.generate(user_prompt, system_prompt)
-        click.echo("\n--- Answer ---")
-        click.echo(answer)
-        click.echo("\n--- Sources & Citations ---")
-        for c in citations:
-            click.echo(f"- {c}")
-    except Exception as e:
-        raise click.ClickException(handle_ai_error(e, provider, model))
+    query_cache = QueryEmbeddingCache(repo_path)
+
+    def run_query(q: str):
+        click.echo(f"Searching index for: '{q}'...")
+        try:
+            query_emb = query_cache.get(emb_model, q)
+            if query_emb is None:
+                query_emb = emb_client.get_embedding(q)
+                query_cache.set(emb_model, q, query_emb)
+            search_results = index.hybrid_search(query_emb, q, top_k=5)
+        except Exception as e:
+            raise click.ClickException(handle_ai_error(e, emb_provider, emb_model))
+
+        _print_ask_results(q, search_results, adapter, provider, model)
+
+    if interactive:
+        click.secho(
+            "\nInteractive mode — ask as many questions as you like. Type 'exit', 'quit', or Ctrl-D to stop.",
+            fg="cyan", bold=True
+        )
+        while True:
+            try:
+                q = click.prompt("\nAsk", prompt_suffix="> ")
+            except (EOFError, click.exceptions.Abort):
+                click.echo("\nExiting interactive mode.")
+                break
+            q = q.strip()
+            if not q:
+                continue
+            if q.lower() in ("exit", "quit"):
+                click.echo("Exiting interactive mode.")
+                break
+            run_query(q)
+    else:
+        run_query(query)
 
 @main.command()
 def help():
     """
     Display detailed help menu and usage examples for all Husk commands.
     """
-    click.echo("==================================================")
-    click.echo("                HUSK CLI MENU                     ")
-    click.echo("==================================================")
-    click.echo("Husk is a local-first codebase archaeologist.\n")
-    
-    click.echo("COMMANDS:")
-    click.echo("  husk scan [path_or_url] [--detailed]")
-    click.echo("    - Crawls the repository and inventories all files.")
-    click.echo("    - Use --detailed to extract classes, functions, and git blame annotations.\n")
-    
-    click.echo("  husk graph [path_or_url] [--output path]")
-    click.echo("    - Generates and visualizes a Mermaid module dependency graph.\n")
-    
-    click.echo("  husk hotspots [path_or_url]")
-    click.echo("    - Ranks source files by maintenance risk (Complexity × Git Churn).\n")
-    
-    click.echo("  husk deadcode [path_or_url]")
-    click.echo("    - Scans for unreferenced files in the module import graph.\n")
-    
-    click.echo("  husk init")
-    click.echo("    - Runs the configuration wizard to set up LLM API keys and model parameters.\n")
-    
-    click.echo("  husk doc [path_or_url] [--with-ai] [--ai-budget budget_in_cents]")
-    click.echo("    - Generates structured documentation reports under `/docs`.")
-    click.echo("    - Set --with-ai to run hierarchical Map-Reduce summaries of modules and files.\n")
-    
-    click.echo("  husk ask \"query\" [path_or_url] [--rebuild]")
-    click.echo("    - Ask questions about the codebase in plain English using RAG search.\n")
-    
-    click.echo("EXAMPLES:")
-    click.echo("  * Local Analysis:")
-    click.echo("      husk scan . --detailed")
-    click.echo("      husk hotspots .")
-    click.echo("  * Remote Git Scanning:")
-    click.echo("      husk scan https://github.com/example/project.git")
-    click.echo("  * AI Search:")
-    click.echo("      husk ask \"how does authentication work?\" https://github.com/example/project.git")
-    click.echo("==================================================")
+    render_menu()
 
 if __name__ == "__main__":
     main()

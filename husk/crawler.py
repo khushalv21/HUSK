@@ -26,6 +26,7 @@ EXTENSION_TO_LANG = {
     ".cjs": "javascript",
     ".ts": "typescript",
     ".tsx": "typescript",
+    ".java": "java",
 }
 
 class RepoCrawler:

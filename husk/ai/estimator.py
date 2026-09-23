@@ -5,12 +5,19 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
     # OpenAI
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "gpt-4o": {"input": 2.50, "output": 10.00},
+    "gpt-5": {"input": 1.25, "output": 10.00},
+    "gpt-5-mini": {"input": 0.25, "output": 2.00},
     # Anthropic
     "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
     "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.00},
+    "claude-sonnet-5": {"input": 2.00, "output": 10.00},
+    "claude-opus-5-5": {"input": 4.00, "output": 20.00},
+    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
     # Ollama / Local
     "llama3": {"input": 0.0, "output": 0.0},
     "mistral": {"input": 0.0, "output": 0.0},
+    "qwen2.5-coder:1.5b": {"input": 0.0, "output": 0.0},
+    "nomic-embed-text": {"input": 0.0, "output": 0.0},
 }
 
 class TokenEstimator:
